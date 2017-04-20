@@ -79,6 +79,11 @@ void table_t::begin()
     pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, "BEGIN");
 }
 
+void table_t::simple_commit()
+{
+    pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, "COMMIT");
+}
+
 void table_t::commit()
 {
     stop_copy();
@@ -181,6 +186,14 @@ void table_t::start()
         //TODO: change the type of the geometry column if needed - this can only change to a more permissive type
     }
 
+    simple_commit();
+
+    //create distributed table
+    string dist_table_sql = (fmt("SELECT create_distributed_table('%1%', 'osm_id')") % name).str();
+    pgsql_exec_simple(sql_conn, PGRES_TUPLES_OK, dist_table_sql);
+
+    begin();
+
     //let postgres cache this query as it will presumably happen a lot
     pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("PREPARE get_wkb (" POSTGRES_OSMID_TYPE ") AS SELECT way FROM %1% WHERE osm_id = $1") % name).str());
 
@@ -218,9 +231,23 @@ void table_t::stop()
 
         fprintf(stderr, "Sorting data and creating indexes for %s\n", name.c_str());
 
-        pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("CREATE TABLE %1%_tmp %2% AS SELECT * FROM %1% ORDER BY ST_GeoHash(ST_Transform(ST_Envelope(way),4326),10) COLLATE \"C\"") % name % (table_space ? "TABLESPACE " + table_space.get() : "")).str());
+        //create temporary table and copy table structure
+        pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("CREATE TABLE %1%_tmp %2% AS SELECT * FROM %1% WHERE 1 = 2") % name % (table_space ? "TABLESPACE " + table_space.get() : "")).str());
+        //create distributed table
+        pgsql_exec_simple(sql_conn, PGRES_TUPLES_OK, (fmt("SELECT create_distributed_table('%1%_tmp', 'osm_id')") % name).str());
+        //copy data to temporary table
+        pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("INSERT INTO %1%_tmp %2% SELECT * FROM %1%") % name % (table_space ? "TABLESPACE " + table_space.get() : "")).str());
+        //drop original table
         pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("DROP TABLE %1%") % name).str());
-        pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("ALTER TABLE %1%_tmp RENAME TO %1%") % name).str());
+        //re-create original table and copy table structure
+        pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("CREATE TABLE %1% %2% AS SELECT * FROM %1%_tmp WHERE 1 = 2") % name % (table_space ? "TABLESPACE " + table_space.get() : "")).str());
+        //create distributed table
+        pgsql_exec_simple(sql_conn, PGRES_TUPLES_OK, (fmt("SELECT create_distributed_table('%1%', 'osm_id')") % name).str());
+        //copy sorted data from temporary table
+        pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("INSERT INTO %1% %2% SELECT * FROM %1%_tmp ORDER BY ST_GeoHash(ST_Transform(ST_Envelope(way),4326),10) COLLATE \"C\"") % name % (table_space ? "TABLESPACE " + table_space.get() : "")).str());
+        //drop temporary table
+        pgsql_exec_simple(sql_conn, PGRES_COMMAND_OK, (fmt("DROP TABLE %1%_tmp") % name).str());
+
         fprintf(stderr, "Copying %s to cluster by geometry finished\n", name.c_str());
         fprintf(stderr, "Creating geometry index on %s\n", name.c_str());
 

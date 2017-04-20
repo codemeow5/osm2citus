@@ -29,6 +29,7 @@ class table_t
         void stop();
 
         void begin();
+        void simple_commit();
         void commit();
 
         void write_row(osmid_t id, taglist_t const &tags, std::string const &geom);
